@@ -1,0 +1,415 @@
+openapi: 3.1.0
+info:
+  title: kbase — сервис личной базы знаний
+  description: |
+    REST API сервиса личной базы знаний (Markdown-документы). Приём raw
+    Markdown вместе с YAML front-matter, версионирование, полнотекстовый
+    поиск с релевантностью и кэшированием результатов в Redis.
+
+    Базовый путь — `/api/v1`, формат — JSON. Единая обёртка ошибок:
+    `{ "error": { "code": "...", "message": "..." } }`.
+
+    Коды ошибок: `invalid_request` (400), `bad_request` (400, ошибка
+    валидации/парсинга Markdown), `not_found` (404), `internal` (500).
+  version: 1.0.0
+
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Локальный запуск через docker compose
+
+tags:
+  - name: Documents
+    description: CRUD документов и история версий
+  - name: Search
+    description: Полнотекстовый поиск с фильтрами и кэшем
+  - name: Stats
+    description: Статистика базы
+
+paths:
+  /documents:
+    post:
+      tags: [Documents]
+      summary: Импорт документа
+      description: |
+        Принимает raw Markdown (опционально с YAML front-matter) в поле
+        `content`, парсит, нормализует и валидирует, сохраняет версию 1,
+        индексирует и инвалидирует кэш поиска. Возвращает созданный документ.
+      operationId: createDocument
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content:
+                  type: string
+                  description: Исходный Markdown с опциональным front-matter (до 1 MiB)
+              example:
+                content: |
+                  ---
+                  title: Golang Notes
+                  tags: [go, backend]
+                  category: dev
+                  ---
+                  # Golang Notes
+                  Concurrency and net package notes.
+      responses:
+        '201':
+          description: Документ создан
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Document' }
+        '400':
+          description: Некорректный JSON, пустой content или ошибка валидации Markdown
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: Внутренняя ошибка
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /documents/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/DocumentId' }
+    get:
+      tags: [Documents]
+      summary: Получить документ
+      description: Возвращает актуальную (текущую) версию неудалённого документа.
+      operationId: getDocument
+      responses:
+        '200':
+          description: Документ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Document' }
+        '400':
+          description: Некорректный UUID
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: Документ не найден или удалён
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    put:
+      tags: [Documents]
+      summary: Обновить документ
+      description: |
+        Создаёт новую версию (#current+1), обновляет метаданные/тело и
+        переиндексирует документ, инвалидируя кэш поиска.
+      operationId: updateDocument
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content:
+                  type: string
+                  description: Полный новый Markdown
+      responses:
+        '200':
+          description: Обновлённый документ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Document' }
+        '400':
+          description: Некорректный запрос или ошибка валидации Markdown
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: Документ не найден
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    delete:
+      tags: [Documents]
+      summary: Удалить документ
+      description: |
+        Мягкое удаление (soft delete): метка deleted_at, история версий
+        сохраняется. Документ удаляется из индекса, кэш поиска инвалидируется.
+      operationId: deleteDocument
+      responses:
+        '204':
+          description: Удалён (без тела)
+        '400':
+          description: Некорректный UUID
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: Документ не найден или уже удалён
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /documents/{id}/versions:
+    parameters:
+      - { $ref: '#/components/parameters/DocumentId' }
+    get:
+      tags: [Documents]
+      summary: История версий документа
+      description: Возвращает все версии документа по возрастанию номера.
+      operationId: listVersions
+      responses:
+        '200':
+          description: Список версий
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Version' }
+        '404':
+          description: Документ не найден
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /documents/{id}/versions/{number}:
+    parameters:
+      - { $ref: '#/components/parameters/DocumentId' }
+      - name: number
+        in: path
+        required: true
+        description: Номер версии (>= 1)
+        schema:
+          type: integer
+          minimum: 1
+    get:
+      tags: [Documents]
+      summary: Конкретная версия документа
+      operationId: getVersion
+      responses:
+        '200':
+          description: Версия
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Version' }
+        '404':
+          description: Документ или версия не найдены
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /search:
+    get:
+      tags: [Search]
+      summary: Полнотекстовый поиск
+      description: |
+        Поиск по индексу с фильтрами (теги/категория/диапазон дат обновления),
+        выбором метода скоринга (`bm25` или `tfidf`), сортировкой, подсветкой
+        совпадений и пагинацией. Результат кэшируется в Redis на `CACHE_TTL`
+        и инвалидируется при изменении/удалении документов.
+      operationId: search
+      parameters:
+        - name: q
+          in: query
+          description: Строка запроса. Пустая — обзор всех документов (match-all).
+          schema: { type: string }
+        - name: method
+          in: query
+          description: Метод скоринга.
+          schema:
+            type: string
+            enum: [bm25, tfidf]
+            default: bm25
+        - name: tags
+          in: query
+          description: Фильтр по тегам (OR). Может повторяться.
+          schema:
+            type: array
+            items: { type: string }
+        - name: category
+          in: query
+          description: Фильтр по категории (точное совпадение keyword).
+          schema: { type: string }
+        - name: from
+          in: query
+          description: Нижняя граница даты обновления (RFC3339).
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          description: Верхняя граница даты обновления (RFC3339).
+          schema:
+            type: string
+            format: date-time
+        - name: sort
+          in: query
+          description: Поле сортировки.
+          schema:
+            type: string
+            enum: [relevance, title, created_at, updated_at]
+            default: relevance
+        - name: page
+          in: query
+          description: Номер страницы (1-based).
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: page_size
+          in: query
+          description: Размер страницы.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: Результаты поиска
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SearchResult' }
+        '400':
+          description: Некорректные параметры запроса
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /stats:
+    get:
+      tags: [Stats]
+      summary: Статистика базы
+      description: Количество неудалённых документов и суммарный размер их тел.
+      operationId: getStats
+      responses:
+        '200':
+          description: Статистика
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Stats' }
+
+components:
+  parameters:
+    DocumentId:
+      name: id
+      in: path
+      required: true
+      description: UUID документа.
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    Document:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string }
+        category: { type: string }
+        tags:
+          type: array
+          items: { type: string }
+        authors:
+          type: array
+          items: { type: string }
+        body: { type: string, description: Нормализованное тело Markdown }
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        version:
+          type: integer
+          description: Текущий номер версии
+      required: [id, title, body, created_at, updated_at, version]
+
+    Version:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        document_id: { type: string, format: uuid }
+        number: { type: integer }
+        body: { type: string }
+        meta:
+          type: object
+          properties:
+            title: { type: string }
+            tags:
+              type: array
+              items: { type: string }
+            category: { type: string }
+            authors:
+              type: array
+              items: { type: string }
+        created_at:
+          type: string
+          format: date-time
+      required: [id, document_id, number, body, created_at]
+
+    SearchResult:
+      type: object
+      properties:
+        query: { type: string }
+        method: { type: string, enum: [bm25, tfidf] }
+        total:
+          type: integer
+          format: int64
+          description: Общее число совпадений (независимо от страницы)
+        page:
+          type: integer
+          minimum: 1
+        page_size:
+          type: integer
+          minimum: 1
+          maximum: 100
+        hits:
+          type: array
+          items: { $ref: '#/components/schemas/Hit' }
+      required: [query, method, total, page, page_size, hits]
+
+    Hit:
+      type: object
+      properties:
+        document_id: { type: string, format: uuid }
+        title: { type: string }
+        score:
+          type: number
+          format: double
+          description: Оценка релевантности выбранного метода скоринга
+        snippet:
+          type: string
+          description: Фрагмент текста с подсветкой совпадений (`<mark>`)
+        updated_at:
+          type: string
+          format: date-time
+      required: [document_id, title, score, snippet, updated_at]
+
+    Stats:
+      type: object
+      properties:
+        documents:
+          type: integer
+          description: Количество неудалённых документов
+        total_size:
+          type: integer
+          format: int64
+          description: Суммарный размер тел документов в байтах
+      required: [documents, total_size]
+
+    Error:
+      type: object
+      description: Единая обёртка ошибок.
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              enum: [invalid_request, bad_request, not_found, internal]
+            message:
+              type: string
+          required: [code, message]
+      required: [error]
